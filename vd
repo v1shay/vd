@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""vd — operate native app windows on a local extended display.
+
+vd start | status | stop | doctor | permissions | authorize
+vd view [DISPLAY_ID | --list]      Live full-terminal viewer (- shows more desktop, + enlarges, 0 resets, q closes)
+vd apps                            List running GUI apps
+vd windows [--all]                 List VD windows or all on-screen windows
+vd return PID WINDOW               Bring a VD window back to the main display
+vd move PID WINDOW                 Move an existing window onto VD
+vd launch APP [FILE|URL]               Open a separate app instance on VD
+vd inspect PID WINDOW              List accessible controls and their element IDs
+vd press PID WINDOW ELEMENT        Press a control
+vd set PID WINDOW ELEMENT VALUE    Set an accessible value
+vd click PID WINDOW X Y            Click at window-local coordinates
+vd drag PID WINDOW X Y TO_X TO_Y   Drag within a window
+vd scroll PID WINDOW X Y PIXELS    Scroll in a window
+vd type PID WINDOW TEXT            Type into a background process with one window
+vd key PID WINDOW CODE             Send a macOS virtual key code
+vd screenshot PATH                 Save a PNG of the entire VD display
+vd screenshot PID WINDOW PATH      Save a PNG of one VD window
+
+APP accepts a bundle identifier or installed app name. Coordinates use points
+from the top left. Inspect or take a screenshot after input to verify its effect.
+"""
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import select
+import re
+from urllib.parse import urlparse
+import subprocess
+import sys
+import time
+
+# Imported resources live inside a sealed macOS application bundle.
+sys.dont_write_bytecode = True
+
+RES = Path(__file__).resolve().parent
+APP = RES.parents[1]
+HOST = APP / "Contents/MacOS/Virtual Display"
+
+def request(*args):
+    result = subprocess.run([HOST, *args], capture_output=True, text=True, timeout=18)
+    if result.returncode:
+        raise ValueError(result.stdout.strip() or result.stderr.strip() or "VD host unavailable")
+    return json.loads(result.stdout)
+
+def connect():
+    if not HOST.is_file() or not os.access(HOST, os.X_OK):
+        raise ValueError(f"VD host executable is missing or not executable: {HOST}")
+    try:
+        return request("permissions")
+    except ValueError:
+        launch = subprocess.run(["/usr/bin/open","-g","-n",str(APP),"--args","serve"], capture_output=True, text=True)
+        hint = ("Codex agents: use the registered virtual-display MCP server: "
+                "vd_observe for status or permissions, vd for actions, vd_view for screenshots. "
+                "If this session does not list that server, start a new local Codex session.")
+        if launch.returncode:
+            raise ValueError("The VD executable is installed, but this shell cannot launch or reach its macOS GUI host. " + hint) from None
+        for _ in range(50):
+            time.sleep(.1)
+            try: return request("permissions")
+            except ValueError: continue
+        raise ValueError("This shell could not reach the VD host after launch. " + hint)
+
+def rex_input(op, values, state):
+    pid, wid = map(int, values[:2])
+    target = next((w for w in state["windows"] if w["pid"] == pid and w["window"] == wid), None)
+    if not target or target["app"] not in ("Rex", "Rex Beta"):
+        return None
+    binary = shutil.which("rex") or str(Path.home() / "Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex")
+    def query(*args):
+        return json.loads(subprocess.check_output([binary, *args, "--json"], text=True, timeout=8))
+    clients = [c for c in query("client","ls")["clients"] if c.get("info",{}).get("kind")=="app" and c.get("connection_state")=="connected"]
+    owned = [c for c in clients if c.get("principal",{}).get("pid")==pid]
+    if len(owned)!=1:
+        raise ValueError("Cannot identify the Rex client for this window")
+    matches=[]
+    for session in query("session","ls")["sessions"]:
+        sid=session["session_id"]
+        if sid not in owned[0].get("session_ids",[]): continue
+        suffix=" - "+session["label"]
+        if not target["title"].endswith(suffix): continue
+        for window in query("window","ls","-s",sid)["windows"]:
+            if window["label"]+suffix==target["title"]:
+                matches.append((sid,window))
+    if len(matches)!=1:
+        raise ValueError("Rex window title does not identify a unique terminal layout")
+    sid,window=matches[0]
+    others=request("all-windows")["windows"]
+    if any(w["window"]!=wid and w["app"]==target["app"] and w["title"]==target["title"] for w in others):
+        raise ValueError("Another Rex window is displaying this layout; use a separate VD session")
+    block=window["focused_block_id"]
+    current=request("status")
+    if target not in current["windows"]: raise ValueError("Rex window changed before delivery")
+    if op=="type":
+        subprocess.run([binary,"send","-b",block],input=values[2],text=True,check=True,timeout=8)
+    else:
+        keys={"36":"enter","48":"tab","51":"backspace","53":"escape","123":"left","124":"right","125":"down","126":"up"}
+        if values[2] not in keys: return None
+        subprocess.run([binary,"send-key","-b",block,keys[values[2]]],check=True,timeout=8)
+    return {"delivered":True,"transport":"rex","block":block}
+
+def launch_chrome(value, state):
+    app = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    bounds = list(map(int, re.findall(r"-?\d+",state["bounds"])))
+    x,y,w,h = bounds
+    area = dict(left=x+24,top=y+24,width=min(1100,w-48),height=min(760,h-48))
+    url = value or "about:blank"
+    if not urlparse(url).scheme:
+        file = Path(url).expanduser().resolve(strict=True)
+        url = file.as_uri()
+    proc=subprocess.Popen(["node",RES/"chrome.cjs",app,url,json.dumps(area)],stdout=subprocess.PIPE,
+                          stdin=subprocess.DEVNULL,stderr=subprocess.DEVNULL,text=True,start_new_session=True)
+    try:
+        if not select.select([proc.stdout],[],[],18)[0]:
+            raise ValueError("Chrome did not start its private input connection")
+        line=proc.stdout.readline().strip()
+        if not line.isdigit():raise ValueError("Chrome failed to create a dedicated VD page")
+        return int(line)
+    finally:proc.stdout.close()
+
+def chrome_input(op,values,state):
+    pid,wid=map(int,values[:2])
+    window=next((w for w in state["windows"] if w["pid"]==pid and w["window"]==wid),None)
+    if not window or window["app"]!="Google Chrome":return None
+    endpoint=Path.home()/"Library/Caches/local.vd.host/chrome"/f"{pid}.sock"
+    if not endpoint.is_socket():
+        if sum(w["pid"]==pid for w in request("all-windows")["windows"])>1:
+            raise ValueError("Chrome shares this process across windows. Run vd launch Chrome URL for a page with targeted keyboard input.")
+        return None
+    visible=[w for w in request("all-windows")["windows"] if w["pid"]==pid]
+    if len(visible)!=1:raise ValueError("Dedicated Chrome has multiple windows; open the requested URL in a separate vd launch Chrome window")
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.settimeout(12)
+        conn.connect(str(endpoint))
+        conn.sendall((json.dumps({"op":op,"value":values[2]})+"\n").encode())
+        with conn.makefile("rb") as stream:reply=json.load(stream)
+    if "error" in reply:raise ValueError(reply["error"])
+    return reply
+
+def main(args):
+    if not args and sys.stdin.isatty() and sys.stdout.isatty(): args=["view"]
+    if not args or args[0] in ("--help","help","-h"):
+        print(__doc__)
+        return
+    op,*values=args
+    if op=="view":
+        import viewer
+        try: viewer.watch(APP,HOST,values)
+        except KeyboardInterrupt: pass
+        return
+    if op=="doctor": return request(op)
+    if op=="apps":
+        return json.loads(subprocess.check_output([RES/"launcher","apps"],text=True))
+    if op=="stop": return request(op)
+    access=connect()
+    if op=="permissions": return access
+    if op=="authorize": return request(op)
+    if op=="windows" and values==["--all"]: return request("all-windows")
+    allowed={"start":{0},"status":{0},"windows":{0},"move":{2},"return":{2},"launch":{1,2},"inspect":{2},"press":{3},"set":{4},"click":{4},"drag":{6},"scroll":{5},"type":{3},"key":{3},"screenshot":{1,3}}
+    if op not in allowed or len(values) not in allowed[op]: raise ValueError("Invalid arguments. Run vd help.")
+    if op=="status": return request(op)
+    for attempt in range(12):
+        try:
+            state=request("start")
+            break
+        except ValueError:
+            if attempt==11: raise
+            time.sleep(.15)
+    if op=="start": return state
+    if op in ("type","key"):
+        if op=="key":
+            aliases={"space":"49","enter":"36","return":"36","up":"126","down":"125","left":"123","right":"124","tab":"48","escape":"53","backspace":"51"}
+            values[2]=aliases.get(values[2].lower(),values[2])
+            if not values[2].isascii() or not values[2].isdigit() or int(values[2])>127:
+                raise ValueError("Expected a macOS key code or named key such as Space or Enter")
+        delivery=chrome_input(op,values,state) or rex_input(op,values,state)
+        if delivery is not None: return delivery
+    if op=="screenshot":
+        values[-1]=str(Path(values[-1]).expanduser().resolve())
+        return request("display-image" if len(values)==1 else "window-image",*values)
+    if op in ("launch","move"):
+        if not access["accessibility"]: raise ValueError("Enable Accessibility for Virtual Display using vd authorize.")
+        if op=="launch":
+            if values[0].lower() in {"chrome","google chrome","google chrome.app","com.google.chrome"}:
+                pid=launch_chrome(values[1] if len(values)==2 else None,state)
+            else:
+                if len(values)==2: values[1]=str(Path(values[1]).expanduser().resolve())
+                pid=int(subprocess.check_output([RES/"launcher","launch",*values],text=True,timeout=20))
+            for _ in range(60):
+                match=next((w for w in request("all-windows")["windows"] if w["pid"]==pid),None)
+                if match: break
+                time.sleep(.15)
+            else: raise ValueError(f"Process {pid} did not create a visible window")
+            values=[str(pid),str(match["window"])]
+        placed=next((w for w in request("windows")["windows"] if [str(w["pid"]),str(w["window"])]==values),None)
+        if placed: return placed
+        request("place",*values)
+        for _ in range(25):
+            match=next((w for w in request("windows")["windows"] if [str(w["pid"]),str(w["window"])]==values),None)
+            if match: return match
+            time.sleep(.1)
+        raise ValueError("Window placement could not be verified")
+    return request(op,*values)
+
+if __name__=="__main__":
+    try:
+        result=main(sys.argv[1:])
+        if result is not None: print(json.dumps(result,ensure_ascii=False))
+    except (OSError,ValueError,subprocess.SubprocessError) as error:
+        sys.exit(str(error))
