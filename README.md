@@ -2,6 +2,8 @@
 
 `vd` controls native Mac app windows on a 1440 × 900 extended display in the current login. Run `vd help` for commands and argument order. The host starts without opening an editor or preview window.
 
+![The VD terminal viewer in Rex showing Chrome’s dinosaur game on a virtual Mac display](docs/terminal-viewer.jpg)
+
 From a Rex or other Kitty-graphics terminal, run `vd` to watch the running workspace full-screen. `vd view --list` lists available virtual displays and `vd view ID` selects one. On the VD workspace, `-` increases the virtual monitor resolution, `+` decreases it, and `0` restores 1440×900. The picture stays fitted to the terminal. Tab switches between them, and q or Escape returns to the shell. Capture is read-only and uses the signed app's Screen Recording grant. ScreenCaptureKit sends changed frames at up to eight frames per second.
 
 In Codex, ask “Use the vd CLI to open this PDF in Preview on the virtual display.” The registered `virtual-display` MCP server provides action, observation, and PNG viewing tools. Codex applies the session’s normal tool approval settings. A terminal can call `~/.local/bin/vd` directly.
