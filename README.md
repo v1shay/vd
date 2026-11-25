@@ -1,4 +1,4 @@
-# Virtual Display CLI
+# virtual display CLI [concept]
 
 `vd` controls native Mac app windows on a 1440 × 900 extended display in the current login. Run `vd help` for commands and argument order. The host starts without opening an editor or preview window.
 
